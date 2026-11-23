@@ -1,0 +1,31 @@
+[package]
+name        = "multipart-nv"
+version     = "0.1.0"
+description = "A writer of multipart/form-data request bodies, RFC 7578: text fields and file parts, a boundary chosen so that it cannot occur in the content, and the pieces of a body as separate byte strings so a large file is written to a connection in chunks between a part's head and its tail.  A strict reader of a complete body is included for tests."
+license     = "Apache-2.0"
+
+# `experimental` because no program outside this repository has used the
+# package yet.
+stability   = "experimental"
+
+# `core`: byte strings in, byte strings out.  The random seed of a
+# boundary is a parameter, because a `core` package may not read a
+# random source, and the file is read and the body sent by the caller.
+layer       = "core"
+
+category    = "web"
+
+tags        = ["multipart", "form-data", "rfc-7578", "rfc-2046", "http", "upload", "boundary"]
+repository  = "https://github.com/novolang/multipart-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.26.1"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "Writing multipart/form-data bodies, with a file streamed between its head and its tail"
+
+[dependencies]
+# None.  form-nv reads multipart/form-data on a server, with limits and
+# in chunks; this package writes it and reads a complete body in tests.

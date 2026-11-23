@@ -1,0 +1,60 @@
+// mperr — what the writer and the reader of a multipart body refuse.
+
+// Why a boundary or a body was refused.
+//
+// ```novo
+// use mperr
+//
+// fn main() [io]
+//     println(mperr.code_of(MpNoClosing))   // no-closing
+// ```
+pub enum MpFault
+    // A boundary RFC 2046 section 5.1.1 does not allow: it is empty,
+    // longer than 70 bytes, ends with a space, or holds a byte outside
+    // its set of boundary characters.
+    MpBadBoundary(boundary: Str)
+    // The body does not begin with `--` and the boundary.
+    MpNoOpening
+    // The body ends before the closing delimiter `--boundary--`.
+    MpNoClosing
+    // The headers of this part, counted from 0, are not lines of the form
+    // `Name: value` ended by an empty line.
+    MpBadPartHeaders(part: Int)
+    // The delimiter, two hyphens and the boundary, occurs in this part's
+    // content or in its name, file name or media type, so a reader would
+    // end the part there.
+    MpBoundaryInContent(part: Int)
+    // This part has no `Content-Disposition: form-data` header.
+    MpNoDisposition(part: Int)
+    // This part's `Content-Disposition` has no `name` parameter.
+    MpNoName(part: Int)
+
+impl Error for MpFault
+    // The one-line report.
+    fn message(self) -> Str
+        match self
+            MpBadBoundary(b)       => "`${b}` is not a boundary RFC 2046 allows"
+            MpNoOpening            => "the body does not begin with the boundary"
+            MpNoClosing            => "the body ends before the closing boundary"
+            MpBadPartHeaders(i)    => "part ${i} has malformed headers"
+            MpBoundaryInContent(i) => "part ${i} holds the delimiter, so the body would end it early"
+            MpNoDisposition(i)     => "part ${i} has no Content-Disposition: form-data header"
+            MpNoName(i)            => "part ${i} has no name"
+
+// A short stable name for the kind of fault.
+//
+// ```novo
+// use mperr
+//
+// fn main() [io]
+//     println(mperr.code_of(MpNoOpening))   // no-opening
+// ```
+pub fn code_of(f: MpFault) -> Str []
+    match f
+        MpBadBoundary(_)       => "bad-boundary"
+        MpNoOpening            => "no-opening"
+        MpNoClosing            => "no-closing"
+        MpBadPartHeaders(_)    => "bad-part-headers"
+        MpBoundaryInContent(_) => "boundary-in-content"
+        MpNoDisposition(_)     => "no-disposition"
+        MpNoName(_)            => "no-name"

@@ -1,0 +1,281 @@
+// mpwrite — the bytes of a multipart/form-data request body.
+//
+// RFC 7578 defines the body.  Each part is a delimiter line, its
+// headers, an empty line and its content; the body ends with a closing
+// delimiter.
+//
+//   --boundary CRLF
+//   Content-Disposition: form-data; name="field" CRLF
+//   CRLF
+//   value CRLF
+//   --boundary CRLF
+//   Content-Disposition: form-data; name="upload"; filename="a.txt" CRLF
+//   Content-Type: text/plain CRLF
+//   CRLF
+//   file bytes CRLF
+//   --boundary-- CRLF
+//
+// A body is written whole, with `body`, or piece by piece.  A piece-wise
+// writer sends `head_of` of a part, then the bytes of its content in as
+// many chunks as the caller reads them, then `tail`, and ends with
+// `closing`.  The head and the closing delimiter depend on the boundary
+// and the part's names alone, so a file of a gigabyte is never held in
+// memory by this package.  `overhead_of` and the sizes of the contents
+// give the `Content-Length` before the first byte is sent.
+//
+// A name or a file name is written between quotes.  The three bytes that
+// cannot stand in one are written as `%22` for a quote, `%0D` for a
+// carriage return and `%0A` for a line feed, which is what the HTML
+// specification's multipart encoding does.
+//
+// A text field carries no `Content-Type`; RFC 7578 section 4.4 gives it
+// the default `text/plain`. A file part carries one, `application/octet-stream`
+// when the caller gives none.
+
+use std.bytes
+use std.str
+use mperr
+use mpboundary
+
+// One part of a body.
+//
+// ```novo
+// use mpwrite
+//
+// fn main() [io]
+//     let p = mpwrite.field("comment", "hello")
+//     println("${p.name} ${p.is_file}")   // comment false
+// ```
+pub struct MpPart
+    // The field name.
+    name: Str
+    // The file name of a file part, and empty for a text field.
+    filename: Str
+    // Whether the part is a file part.
+    is_file: Bool
+    // The media type of a file part, and empty for a text field.
+    content_type: Str
+    // The content.
+    data: Bytes
+
+// A text field.
+//
+// ```novo
+// use std.bytes
+// use mpwrite
+//
+// fn main() [io]
+//     println("${bytes.len(mpwrite.field("a", "xyz").data)}")   // 3
+// ```
+pub fn field(name: Str, value: Str) -> MpPart []
+    MpPart { name: name,
+        filename: "",
+        is_file: false,
+        content_type: "",
+        data: bytes.from_str(value) }
+
+// A file part.  An empty `content_type` is written as
+// `application/octet-stream`.
+//
+// ```novo
+// use std.bytes
+// use mpwrite
+//
+// fn main() [io]
+//     let p = mpwrite.file("upload", "a.txt", "text/plain", bytes.from_str("hi"))
+//     println("${p.filename} ${p.is_file}")   // a.txt true
+// ```
+pub fn file(name: Str, filename: Str, content_type: Str, data: Bytes) -> MpPart []
+    MpPart { name: name, filename: filename, is_file: true, content_type: content_type, data: data }
+
+// A name or a file name as it stands between quotes in a header.
+fn quoted(s: Str) -> Str
+    str.replace(str.replace(str.replace(s, "\"", "%22"), "\r", "%0D"), "\n", "%0A")
+
+// The bytes before a part's content: the delimiter line, the part's
+// headers and the empty line.  The content of `p` is not used, so a part
+// that will be streamed is described by a part with an empty `data`.
+//
+// ```novo
+// use std.bytes
+// use mpboundary
+// use mpwrite
+//
+// fn main() [io]
+//     let b = mpboundary.parse("XX")!
+//     print(bytes.to_str(mpwrite.head_of(b, mpwrite.field("a", ""))))
+//     // --XX
+//     // Content-Disposition: form-data; name="a"
+//     //
+// ```
+pub fn head_of(b: mpboundary.MpBoundary, p: MpPart) -> Bytes []
+    var text = "--" + mpboundary.text(b) + "\r\nContent-Disposition: form-data; name=\"" + quoted(p.name) + "\""
+    if p.is_file
+        text = text + "; filename=\"" + quoted(p.filename) + "\"\r\nContent-Type: "
+        if str.len(p.content_type) == 0
+            text = text + "application/octet-stream"
+        else
+            text = text + p.content_type
+    bytes.from_str(text + "\r\n\r\n")
+
+// The bytes after a part's content: the line break that precedes the next
+// delimiter.
+//
+// ```novo
+// use std.bytes
+// use mpwrite
+//
+// fn main() [io]
+//     println("${bytes.len(mpwrite.tail())}")   // 2
+// ```
+pub fn tail() -> Bytes []
+    bytes.from_str("\r\n")
+
+// The closing delimiter, which ends the body.
+//
+// ```novo
+// use std.bytes
+// use mpboundary
+// use mpwrite
+//
+// fn main() [io]
+//     let b = mpboundary.parse("XX")!
+//     print(bytes.to_str(mpwrite.closing(b)))   // --XX--
+// ```
+pub fn closing(b: mpboundary.MpBoundary) -> Bytes []
+    bytes.from_str("--" + mpboundary.text(b) + "--\r\n")
+
+// How many bytes of a body are not the content of a part: every head,
+// every tail and the closing delimiter.  The `Content-Length` of a
+// body is this plus the sizes of the contents.
+//
+// ```novo
+// use std.bytes
+// use mpboundary
+// use mpwrite
+//
+// fn main() [io]
+//     let b = mpboundary.parse("XX")!
+//     println("${mpwrite.overhead_of(b, [mpwrite.field("a", "1")])}")   // 76
+// ```
+pub fn overhead_of(b: mpboundary.MpBoundary, parts: [MpPart]) -> Int []
+    var n = bytes.len(closing(b))
+    for p in parts
+        n += bytes.len(head_of(b, p)) + 2
+    n
+
+// The index of the first part that holds the delimiter of `b` in its
+// content, name, file name or media type, or -1.
+//
+// A caller that writes a body piece by piece asks this of the parts it
+// can hold in memory before the first byte is sent.
+//
+// ```novo
+// use std.bytes
+// use mpboundary
+// use mpwrite
+//
+// fn main() [io]
+//     let b = mpboundary.parse("XX")!
+//     println("${mpwrite.first_clash(b, [mpwrite.field("a", "--XX")])}")   // 0
+// ```
+pub fn first_clash(b: mpboundary.MpBoundary, parts: [MpPart]) -> Int []
+    let needle = bytes.from_str("--" + mpboundary.text(b))
+    var at = -1
+    for i in 0..list.len(parts)
+        if at < 0 and holds_delimiter(parts[i], needle)
+            at = i
+    at
+
+// Whether the content or the header text of a part holds `needle`.
+fn holds_delimiter(p: MpPart, needle: Bytes) -> Bool
+    let meta = bytes.from_str(p.name + "\n" + p.filename + "\n" + p.content_type)
+    bytes.find(p.data, needle, 0) != None or bytes.find(meta, needle, 0) != None
+
+// The whole body: every part in order, then the closing delimiter.
+//
+// A part that holds the delimiter makes the answer a fault that names
+// the part; `sealed` chooses a boundary that makes that impossible.
+//
+// ```novo
+// use std.bytes
+// use mpboundary
+// use mpwrite
+//
+// fn main() [io]
+//     let b = mpboundary.parse("XX")!
+//     print(bytes.to_str(mpwrite.body(b, [mpwrite.field("a", "1")])!))
+//     // --XX
+//     // Content-Disposition: form-data; name="a"
+//     //
+//     // 1
+//     // --XX--
+// ```
+pub fn body(b: mpboundary.MpBoundary, parts: [MpPart]) -> Result<Bytes, mperr.MpFault> []
+    let clash = first_clash(b, parts)
+    if clash >= 0
+        return Err(mperr.MpBoundaryInContent(clash))
+    Ok(assemble(b, parts))
+
+// The bytes of the body, with the boundary already checked.
+fn assemble(b: mpboundary.MpBoundary, parts: [MpPart]) -> Bytes
+    var total = overhead_of(b, parts)
+    for p in parts
+        total += bytes.len(p.data)
+    var out = bytes.zeros(total)
+    var at = 0
+    for p in parts
+        let head = head_of(b, p)
+        out = bytes.copy_into(out, at, head, 0, bytes.len(head))
+        at += bytes.len(head)
+        out = bytes.copy_into(out, at, p.data, 0, bytes.len(p.data))
+        at += bytes.len(p.data)
+        out = bytes.copy_into(out, at, tail(), 0, 2)
+        at += 2
+    let end = closing(b)
+    out = bytes.copy_into(out, at, end, 0, bytes.len(end))
+    out
+
+// A body whose boundary is chosen from `seed` so that no part holds it,
+// together with the boundary.
+//
+// A caller sets the `Content-Type` header from `mpboundary.content_type`
+// of the boundary.  The text searched for is the delimiter, two hyphens
+// and the boundary, in the content, the name, the file name and the
+// media type of every part.
+//
+// ```novo
+// use std.bytes
+// use mpboundary
+// use mpwrite
+//
+// fn main() [io]
+//     let sealed = mpwrite.sealed(42, [mpwrite.field("a", "1")])
+//     println("${bytes.len(sealed.body)}")   // 133
+// ```
+pub fn sealed(seed: Int, parts: [MpPart]) -> MpSealed []
+    let b = mpboundary.choose_by(seed, t => first_clash_text(parts, t))
+    MpSealed { boundary: b, body: assemble(b, parts) }
+
+// Whether the delimiter for the boundary text occurs in any part.
+fn first_clash_text(parts: [MpPart], text: Str) -> Bool
+    let needle = bytes.from_str("--" + text)
+    var found = false
+    for p in parts
+        if holds_delimiter(p, needle)
+            found = true
+    found
+
+// A boundary and the body written with it.
+//
+// ```novo
+// use std.bytes
+// use mpwrite
+//
+// fn main() [io]
+//     let s = mpwrite.sealed(1, [])
+//     println("${bytes.len(s.body) > 0}")   // true
+// ```
+pub struct MpSealed
+    boundary: mpboundary.MpBoundary
+    body: Bytes

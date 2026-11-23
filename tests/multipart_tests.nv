@@ -1,0 +1,221 @@
+// multipart_tests — the writer against the RFC 7578 example and against
+// bodies built by urllib3's encoder, and the whole round trip through the
+// reader of this package.
+//
+// The urllib3 fixtures were produced by `urllib3.filepost.
+// encode_multipart_formdata` of urllib3 2.0.7, which follows the HTML
+// specification's multipart encoding.  They are held as hexadecimal so
+// that no escape of this file's syntax decides a byte.
+
+use std.test
+use std.bytes
+use std.str
+use mpboundary
+use mpread
+use mpwrite
+
+fn hexb(h: Str) -> Bytes
+    bytes.from_hex(h) ?? bytes.zeros(0)
+
+fn bnd(s: Str) -> mpboundary.MpBoundary
+    match mpboundary.parse(s)
+        Ok(b)  => b
+        Err(e) =>
+            test.fail(e.message())
+            mpboundary.choose(0, [])
+
+fn body_of(b: mpboundary.MpBoundary, parts: [mpwrite.MpPart]) -> Bytes
+    match mpwrite.body(b, parts)
+        Ok(x)  => x
+        Err(e) =>
+            test.fail(e.message())
+            bytes.zeros(0)
+
+// ── The RFC's example ───────────────────────────────────────────────
+
+// RFC 7578 section 4.1: a text field and a file, boundary `AaB03x`.
+fn rfc_example() -> Str
+    str.join([
+        "--AaB03x\r\n",
+        "Content-Disposition: form-data; name=\"submit-name\"\r\n",
+        "\r\n",
+        "Larry\r\n",
+        "--AaB03x\r\n",
+        "Content-Disposition: form-data; name=\"files\"; filename=\"file1.txt\"\r\n",
+        "Content-Type: text/plain\r\n",
+        "\r\n",
+        "... contents of file1.txt ...\r\n",
+        "--AaB03x--\r\n"],
+    "")
+
+@test
+fn test_the_body_of_the_rfc_7578_example_is_written_byte_for_byte()
+    let parts = [mpwrite.field("submit-name", "Larry"),
+        mpwrite.file("files", "file1.txt", "text/plain", bytes.from_str("... contents of file1.txt ..."))]
+    test.assert_eq_str(bytes.to_str(body_of(bnd("AaB03x"), parts)), rfc_example())
+
+@test
+fn test_the_rfc_example_reads_back_to_its_parts()
+    match mpread.parse(bytes.from_str(rfc_example()), bnd("AaB03x"))
+        Err(e)    => test.fail(e.message())
+        Ok(parts) =>
+            test.assert_eq(list.len(parts), 2)
+            test.assert_eq(parts[0].name, "submit-name")
+            test.assert(not parts[0].is_file)
+            test.assert_eq(bytes.to_str(parts[0].data), "Larry")
+            test.assert_eq(parts[1].name, "files")
+            test.assert(parts[1].is_file)
+            test.assert_eq(parts[1].filename, "file1.txt")
+            test.assert_eq(parts[1].content_type, "text/plain")
+            test.assert_eq(bytes.to_str(parts[1].data), "... contents of file1.txt ...")
+
+// ── Against another encoder ─────────────────────────────────────────
+
+@test
+fn test_a_field_and_a_binary_file_match_urllib3_byte_for_byte()
+    let expected = hexb("2d2d58580d0a436f6e74656e742d446973706f736974696f6e3a20666f726d2d646174613b206e616d653d2261220d0a0d0a310d0a2d2d58580d0a436f6e74656e742d446973706f736974696f6e3a20666f726d2d646174613b206e616d653d2266223b2066696c656e616d653d22782e747874220d0a436f6e74656e742d547970653a20746578742f706c61696e0d0a0d0a686900ff0d0a2d2d58582d2d0d0a")
+    let parts = [mpwrite.field("a", "1"), mpwrite.file("f", "x.txt", "text/plain", hexb("686900ff"))]
+    test.assert_eq_str(bytes.to_hex(body_of(bnd("XX"), parts)), bytes.to_hex(expected))
+
+@test
+fn test_names_with_quotes_line_breaks_and_non_ascii_match_urllib3()
+    let expected = hexb("2d2d58580d0a436f6e74656e742d446973706f736974696f6e3a20666f726d2d646174613b206e616d653d2277652532326972642530442530416e616d65220d0a0d0a760d0a2d2d58580d0a436f6e74656e742d446973706f736974696f6e3a20666f726d2d646174613b206e616d653d2266223b2066696c656e616d653d226125323262253041632e747874220d0a436f6e74656e742d547970653a206170706c69636174696f6e2f6f637465742d73747265616d0d0a0d0a0001202d2d5858206e6f7420612064656c696d697465720d0a2d2d5858590d0a2d2d58580d0a436f6e74656e742d446973706f736974696f6e3a20666f726d2d646174613b206e616d653d22c3a9220d0a0d0ac3bc0d0a2d2d58582d2d0d0a")
+    // The file content of that body holds `--XX ` and `\r\n--XXY`, which
+    // are not delimiters: the writer refuses them for the boundary XX, and
+    // the reader reads the body.
+    let hostile = hexb("0001202d2d5858206e6f7420612064656c696d697465720d0a2d2d585859")
+    let parts = [mpwrite.field("we\"ird\r\nname", "v"),
+        mpwrite.file("f", "a\"b\nc.txt", "", hostile),
+        mpwrite.field("é", "ü")]
+    match mpwrite.body(bnd("XX"), parts)
+        Ok(_)  => test.fail("the content holds the delimiter")
+        Err(e) => test.assert_eq(e.message(), "part 1 holds the delimiter, so the body would end it early")
+    match mpread.parse(expected, bnd("XX"))
+        Err(e)   => test.fail(e.message())
+        Ok(read) =>
+            test.assert_eq(list.len(read), 3)
+            test.assert_eq(read[0].name, "we\"ird\r\nname")
+            test.assert_eq(read[1].filename, "a\"b\nc.txt")
+            test.assert_eq(read[1].content_type, "application/octet-stream")
+            test.assert_eq(bytes.to_hex(read[1].data), bytes.to_hex(hostile))
+            test.assert_eq(read[2].name, "é")
+            test.assert_eq(bytes.to_str(read[2].data), "ü")
+    // With a boundary the content does not hold, the writer's bytes are
+    // urllib3's bytes for the same input.
+    let clean = [mpwrite.field("we\"ird\r\nname", "v"), mpwrite.field("é", "ü")]
+    let b = bnd("Zz9")
+    test.assert_eq_str(bytes.to_str(body_of(b, clean)),
+        "--Zz9\r\nContent-Disposition: form-data; name=\"we%22ird%0D%0Aname\"\r\n\r\nv\r\n--Zz9\r\nContent-Disposition: form-data; name=\"é\"\r\n\r\nü\r\n--Zz9--\r\n")
+
+// ── Round trips ─────────────────────────────────────────────────────
+
+@test
+fn test_every_part_survives_the_writer_and_the_reader()
+    let blob = hexb("00ff0d0a0d0a2d2dfe")
+    let parts = [
+        mpwrite.field("empty", ""),
+        mpwrite.field("text", "line one\r\nline two\r\n"),
+        mpwrite.file("blob", "b\"in.dat", "", blob),
+        mpwrite.file("none", "", "text/csv", bytes.zeros(0)),
+        mpwrite.field("a b", "c")]
+    let b = bnd("round-trip")
+    match mpread.parse(body_of(b, parts), b)
+        Err(e)   => test.fail(e.message())
+        Ok(read) =>
+            test.assert_eq(list.len(read), 5)
+            test.assert_eq(read[0].name, "empty")
+            test.assert_eq(bytes.len(read[0].data), 0)
+            test.assert_eq(bytes.to_str(read[1].data), "line one\r\nline two\r\n")
+            test.assert_eq(bytes.to_hex(read[2].data), "00ff0d0a0d0a2d2dfe")
+            test.assert_eq(read[2].filename, "b\"in.dat")
+            test.assert_eq(read[2].content_type, "application/octet-stream")
+            test.assert_eq(read[3].filename, "")
+            test.assert(read[3].is_file)
+            test.assert_eq(read[3].content_type, "text/csv")
+            test.assert_eq(bytes.len(read[3].data), 0)
+            test.assert_eq(read[4].name, "a b")
+            test.assert(not read[4].is_file)
+
+@test
+fn test_a_body_with_no_parts_is_the_closing_delimiter_alone()
+    let b = bnd("only")
+    test.assert_eq_str(bytes.to_str(body_of(b, [])), "--only--\r\n")
+    match mpread.parse(body_of(b, []), b)
+        Err(e)   => test.fail(e.message())
+        Ok(read) => test.assert_eq(list.len(read), 0)
+
+// ── Streaming a file ────────────────────────────────────────────────
+
+@test
+fn test_head_chunks_tail_and_closing_make_the_whole_body()
+    let b = bnd("stream")
+    let whole = mpwrite.file("upload", "big.bin", "application/octet-stream", hexb("0001020304050607"))
+    let described = mpwrite.file("upload", "big.bin", "application/octet-stream", bytes.zeros(0))
+    var sent: [Bytes] = []
+    list.push(sent, mpwrite.head_of(b, mpwrite.field("note", "x")))
+    list.push(sent, bytes.from_str("x"))
+    list.push(sent, mpwrite.tail())
+    list.push(sent, mpwrite.head_of(b, described))
+    list.push(sent, hexb("00010203"))
+    list.push(sent, hexb("04050607"))
+    list.push(sent, mpwrite.tail())
+    list.push(sent, mpwrite.closing(b))
+    test.assert_eq_str(bytes.to_hex(bytes.concat(sent)),
+        bytes.to_hex(body_of(b, [mpwrite.field("note", "x"), whole])))
+
+@test
+fn test_the_content_length_is_known_before_the_first_byte_is_sent()
+    let b = bnd("stream")
+    let parts = [mpwrite.field("note", "x"), mpwrite.file("upload", "big.bin", "", bytes.zeros(0))]
+    let file_size = 8
+    test.assert_eq(mpwrite.overhead_of(b, parts) + 1 + file_size,
+        bytes.len(body_of(b,
+        [mpwrite.field("note", "x"), mpwrite.file("upload", "big.bin", "", hexb("0001020304050607"))])))
+
+// ── The boundary ────────────────────────────────────────────────────
+
+@test
+fn test_the_content_type_header_carries_the_boundary_quoted_when_it_must_be()
+    test.assert_eq(mpboundary.content_type(bnd("AaB03x")), "multipart/form-data; boundary=AaB03x")
+    test.assert_eq(mpboundary.content_type(bnd("two words")), "multipart/form-data; boundary=\"two words\"")
+
+@test
+fn test_a_chosen_boundary_avoids_every_part_that_holds_its_delimiter()
+    let first = mpboundary.candidate(9)
+    let trap = mpwrite.file("f", "n", "t", bytes.from_str("a --" + first + " b"))
+    let s = mpwrite.sealed(9, [trap])
+    test.assert_ne(mpboundary.text(s.boundary), first)
+    test.assert_eq(mpboundary.text(s.boundary), mpboundary.candidate(10))
+    match mpread.parse(s.body, s.boundary)
+        Err(e)   => test.fail(e.message())
+        Ok(read) => test.assert_eq(bytes.to_str(read[0].data), "a --" + first + " b")
+    // The header text counts too.
+    let named = mpwrite.field("x--" + first, "v")
+    test.assert_eq(mpboundary.text(mpwrite.sealed(9, [named]).boundary), mpboundary.candidate(10))
+    // Two seeds give two boundaries, and a boundary is always one the
+    // standard allows.
+    test.assert_ne(mpboundary.candidate(1), mpboundary.candidate(2))
+    test.assert_eq(str.len(mpboundary.candidate(0)), 37)
+    match mpboundary.parse(mpboundary.candidate(123456789))
+        Ok(_)  => test.assert(true)
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_the_boundary_search_can_be_asked_about_a_file_it_cannot_hold()
+    let first = mpboundary.candidate(3)
+    let b = mpboundary.choose_by(3, t => t == first)
+    test.assert_eq(mpboundary.text(b), mpboundary.candidate(4))
+    let c = mpboundary.choose(3, [bytes.from_str("--" + first)])
+    test.assert_eq(mpboundary.text(c), mpboundary.candidate(4))
+    test.assert_eq(mpboundary.text(mpboundary.choose(3, [])), first)
+
+@test
+fn test_first_clash_names_the_first_part_that_holds_the_delimiter()
+    let b = bnd("XX")
+    test.assert_eq(mpwrite.first_clash(b, [mpwrite.field("a", "1"), mpwrite.field("b", "--XX"), mpwrite.field("c", "--XX")]),
+        1)
+    test.assert_eq(mpwrite.first_clash(b, [mpwrite.field("a", "1")]), -1)
+    test.assert_eq(mpwrite.first_clash(b, []), -1)
+    test.assert_eq(mpwrite.first_clash(b, [mpwrite.file("--XX", "f", "t", bytes.zeros(0))]), 0)
+    test.assert_eq(mpwrite.first_clash(b, [mpwrite.file("n", "--XX", "t", bytes.zeros(0))]), 0)
+    test.assert_eq(mpwrite.first_clash(b, [mpwrite.file("n", "f", "--XX", bytes.zeros(0))]), 0)

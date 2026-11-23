@@ -1,0 +1,142 @@
+// mpread — a complete multipart/form-data body back into its parts.
+//
+// This reader is for a test of a writer, and for a program that holds
+// a whole body in memory.  It is strict about the shape the writer
+// produces: the body begins with the delimiter, every delimiter is
+// followed by a line break or by the two hyphens of the closing
+// delimiter, and each part has a `Content-Disposition: form-data` header
+// with a `name`.  Text after the closing delimiter is ignored, as RFC
+// 2046 section 5.1.1 says an epilogue is.
+//
+// A server that reads a request as it arrives, with limits on the sizes
+// of parts and fields, uses form-nv instead.
+//
+// A name or a file name has `%22`, `%0D` and `%0A` turned back into a
+// quote, a carriage return and a line feed, the reverse of what the
+// writer does.  A name that holds one of those three sequences as text
+// is read back changed; the format has no way to tell the two apart.
+
+use std.bytes
+use std.str
+use mperr
+use mpboundary
+use mpwrite
+
+// The parts of a body written with `boundary`, in order.
+//
+// ```novo
+// use std.bytes
+// use mpboundary
+// use mpread
+// use mpwrite
+//
+// fn main() [io]
+//     let b = mpboundary.parse("XX")!
+//     let raw = mpwrite.body(b, [mpwrite.field("a", "1"), mpwrite.file("f", "x.txt", "text/plain", bytes.from_str("hi"))])!
+//     match mpread.parse(raw, b)
+//         Err(e) => println(e.message())
+//         Ok(parts) => println("${parts[1].filename} ${bytes.len(parts[1].data)}")   // x.txt 2
+// ```
+pub fn parse(raw: Bytes, b: mpboundary.MpBoundary) -> Result<[mpwrite.MpPart], mperr.MpFault> []
+    let text = mpboundary.text(b)
+    let delim = bytes.from_str("--" + text)
+    let between = bytes.from_str("\r\n--" + text)
+    let crlf = bytes.from_str("\r\n")
+    let blank = bytes.from_str("\r\n\r\n")
+    let hyphens = bytes.from_str("--")
+    if bytes.len(raw) < bytes.len(delim) or not bytes.eq_range(raw, 0, delim, 0, bytes.len(delim))
+        return Err(mperr.MpNoOpening)
+    var parts: [mpwrite.MpPart] = []
+    var pos = bytes.len(delim)
+    var closed = false
+    while not closed
+        if pos + 2 <= bytes.len(raw) and bytes.eq_range(raw, pos, hyphens, 0, 2)
+            closed = true
+        elif pos + 2 <= bytes.len(raw) and bytes.eq_range(raw, pos, crlf, 0, 2)
+            let h = bytes.find(raw, blank, pos) ?? -1
+            if h < 0
+                return Err(mperr.MpNoClosing)
+            let start = h + 4
+            let e = delimiter_at(raw, between, start)
+            if e < 0
+                return Err(mperr.MpNoClosing)
+            let headers = bytes.to_str(bytes.slice(raw, pos + 2, at_least(h, pos + 2)))
+            let part = part_of(list.len(parts), headers, bytes.slice(raw, start, e))!
+            list.push(parts, part)
+            pos = e + bytes.len(between)
+        else
+            return Err(mperr.MpNoClosing)
+    Ok(parts)
+
+// The offset of the first line break and boundary at or after `from`
+// that a line break, or the two hyphens of the closing delimiter,
+// follows, or -1.  The same text followed by anything else is content: a
+// boundary `XX` does not end a part at `\r\n--XXY`.
+fn delimiter_at(raw: Bytes, between: Bytes, from: Int) -> Int
+    var at = bytes.find(raw, between, from) ?? -1
+    var found = false
+    while at >= 0 and not found
+        let after = at + bytes.len(between)
+        let two = bytes.slice(raw, after, after + 2)
+        if bytes.len(two) == 2 and (bytes.to_str(two) == "\r\n" or bytes.to_str(two) == "--")
+            found = true
+        else
+            at = bytes.find(raw, between, at + 1) ?? -1
+    at
+
+// The larger of two numbers.
+fn at_least(a: Int, b: Int) -> Int
+    if a < b
+        b
+    else
+        a
+
+// The parameter `key` of a header value, written `; key="…"`, or `None`.
+fn param(value: Str, key: Str) -> ?Str
+    let needle = "; " + key + "=\""
+    match str.index(value, needle)
+        None     => None
+        Some(at) =>
+            let rest = str.slice(value, at + str.len(needle), str.len(value))
+            match str.index(rest, "\"")
+                None        => None
+                Some(close) => Some(unquoted(str.slice(rest, 0, close)))
+
+// A name as it stood before the writer escaped it.
+fn unquoted(s: Str) -> Str
+    str.replace(str.replace(str.replace(s, "%22", "\""), "%0D", "\r"), "%0A", "\n")
+
+// The part with these header lines and this content.
+fn part_of(index: Int, headers: Str, data: Bytes) -> Result<mpwrite.MpPart, mperr.MpFault>
+    var disposition = ""
+    var content_type = ""
+    var has_disposition = false
+    for line in str.split(headers, "\r\n")
+        if str.len(line) > 0
+            match str.index(line, ":")
+                None     =>
+                    return Err(mperr.MpBadPartHeaders(index))
+                Some(at) =>
+                    let name = str.lower(str.trim(str.slice(line, 0, at)))
+                    let value = str.trim(str.slice(line, at + 1, str.len(line)))
+                    if name == "content-disposition"
+                        disposition = value
+                        has_disposition = true
+                    elif name == "content-type"
+                        content_type = value
+    if not has_disposition or not str.starts_with(str.lower(disposition), "form-data")
+        return Err(mperr.MpNoDisposition(index))
+    match param(disposition, "name")
+        None       => Err(mperr.MpNoName(index))
+        Some(name) =>
+            match param(disposition, "filename")
+                None        => Ok(mpwrite.MpPart { name: name,
+                    filename: "",
+                    is_file: false,
+                    content_type: content_type,
+                    data: data })
+                Some(fname) => Ok(mpwrite.MpPart { name: name,
+                    filename: fname,
+                    is_file: true,
+                    content_type: content_type,
+                    data: data })

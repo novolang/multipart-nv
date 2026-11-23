@@ -1,0 +1,187 @@
+// mpboundary — the boundary that separates the parts of a multipart body.
+//
+// RFC 2046 section 5.1.1 gives a boundary one to 70 characters from a
+// set of letters, digits and a few marks, and forbids a space at the
+// end.  The delimiter between parts is a line break, two hyphens and the
+// boundary; the body ends with two hyphens more.  A part whose content
+// holds that delimiter would end early, so the boundary has to be one
+// that no content holds.
+//
+// A `MpBoundary` is a boundary that passed the check, and every function
+// that writes a delimiter takes one, so a malformed boundary cannot
+// reach the wire.
+
+use std.bytes
+use std.str
+use mperr
+
+// A boundary that RFC 2046 allows.
+//
+// ```novo
+// use mpboundary
+//
+// fn main() [io]
+//     match mpboundary.parse("frontier")
+//         Err(e) => println(e.message())
+//         Ok(b)  => println(mpboundary.text(b))   // frontier
+// ```
+pub struct MpBoundary
+    text: Str
+
+// Whether a byte may stand in a boundary: a letter, a digit, one of
+// `'()+_,-./:=?`, or a space.
+fn boundary_byte(b: Int) -> Bool
+    b >= '0' and b <= '9' or b >= 'a' and b <= 'z' or b >= 'A' and b <= 'Z' or b == ' ' or b == '\'' or b == '(' or b == ')' or b == '+' or b == '_' or b == ',' or b == '-' or b == '.' or b == '/' or b == ':' or b == '=' or b == '?'
+
+// The boundary spelled by `s`, or the fault that says why `s` is not one.
+//
+// ```novo
+// use mpboundary
+//
+// fn main() [io]
+//     match mpboundary.parse("two words ")
+//         Err(e) => println(e.message())   // `two words ` is not a boundary RFC 2046 allows
+//         Ok(b)  => println(mpboundary.text(b))
+// ```
+pub fn parse(s: Str) -> Result<MpBoundary, mperr.MpFault> []
+    var ok = str.len(s) >= 1 and str.len(s) <= 70 and str.byte_at_or(s, str.len(s) - 1, 0) != ' '
+    for i in 0..str.len(s)
+        if not boundary_byte(str.byte_at_or(s, i, 0))
+            ok = false
+    if ok
+        Ok(MpBoundary { text: s })
+    else
+        Err(mperr.MpBadBoundary(s))
+
+// The text of a boundary.
+//
+// ```novo
+// use std.str
+// use mpboundary
+//
+// fn main() [io]
+//     println(str.len(mpboundary.text(mpboundary.choose(1, []))))   // 37
+// ```
+pub fn text(b: MpBoundary) -> Str []
+    b.text
+
+// The value of the `Content-Type` header of a request whose body uses
+// this boundary.
+//
+// ```novo
+// use mpboundary
+//
+// fn main() [io]
+//     let b = mpboundary.parse("frontier")!
+//     println(mpboundary.content_type(b))   // multipart/form-data; boundary=frontier
+// ```
+pub fn content_type(b: MpBoundary) -> Str []
+    if str.contains(b.text, " ")
+        "multipart/form-data; boundary=\"${b.text}\""
+    else
+        "multipart/form-data; boundary=${b.text}"
+
+// The boundary a `Content-Type` header value names, quoted or not.
+//
+// ```novo
+// use mpboundary
+//
+// fn main() [io]
+//     match mpboundary.in_content_type("multipart/form-data; boundary=\"a b\"; charset=utf-8")
+//         Err(e) => println(e.message())
+//         Ok(b)  => println(mpboundary.text(b))   // a b
+// ```
+pub fn in_content_type(value: Str) -> Result<MpBoundary, mperr.MpFault> []
+    let lower = str.lower(value)
+    match str.index(lower, "boundary=")
+        None     => Err(mperr.MpBadBoundary(""))
+        Some(at) =>
+            let rest = str.slice(value, at + 9, str.len(value))
+            if str.starts_with(rest, "\"")
+                let inner = str.slice(rest, 1, str.len(rest))
+                let close = str.index(inner, "\"") ?? str.len(inner)
+                parse(str.slice(inner, 0, close))
+            else
+                let end = str.index(rest, ";") ?? str.len(rest)
+                parse(str.trim(str.slice(rest, 0, end)))
+
+// The sixteen hexadecimal digits of a 64-bit word, high digit first.
+fn hex16(x: Int) -> Str
+    var out = ""
+    for k in 0..16
+        let nibble = (x >>> (60 - 4 * k)) & 15
+        out = out + str.slice("0123456789abcdef", nibble, nibble + 1)
+    out
+
+// The next word of a xorshift sequence.  Zero is a fixed point of the
+// sequence, so a seed is mixed with a constant first.
+fn step(x: Int) -> Int
+    var y = x
+    y = y ^ (y << 13)
+    y = y ^ (y >>> 7)
+    y ^ (y << 17)
+
+// The text `choose` tries for a seed: `novo-` and 32 hexadecimal digits.
+//
+// ```novo
+// use std.str
+// use mpboundary
+//
+// fn main() [io]
+//     println(str.len(mpboundary.candidate(7)))   // 37
+// ```
+pub fn candidate(seed: Int) -> Str []
+    let a = step(seed ^ 2685821657736338717)
+    let b = step(a)
+    "novo-" + hex16(a) + hex16(b)
+
+// A boundary whose text `taken` says occurs nowhere in the body.
+//
+// `choose_by` tries the text of `candidate` for the seed, then for the
+// next seed, until `taken` answers false.  It is `choose` for a caller
+// whose content is not a list of byte strings: a part streamed from a
+// file asks the file, and a body held in several shapes asks each.
+//
+// ```novo
+// use mpboundary
+//
+// fn main() [io]
+//     let first = mpboundary.candidate(3)
+//     let b = mpboundary.choose_by(3, t => t == first)
+//     println("${mpboundary.text(b) == mpboundary.candidate(4)}")   // true
+// ```
+pub fn choose_by(seed: Int, taken: fn(Str) -> Bool) -> MpBoundary []
+    var s = seed
+    while taken(candidate(s))
+        s += 1
+    MpBoundary { text: candidate(s) }
+
+// A boundary that no byte string of `avoid` holds as a delimiter.
+//
+// The text comes from `seed`, which the caller takes from a random
+// source: two requests with different seeds have different boundaries,
+// so a file whose content was written by someone who guessed one
+// boundary does not hold another.  If the text for a seed occurs in
+// something to avoid, the next seed is tried.  A part of a body that is
+// streamed from a file cannot be searched, and the 128 bits of the text
+// are what keep it from occurring there.
+//
+// ```novo
+// use std.bytes
+// use mpboundary
+//
+// fn main() [io]
+//     let hostile = bytes.from_str("--" + mpboundary.candidate(5))
+//     let b = mpboundary.choose(5, [hostile])
+//     println("${mpboundary.text(b) == mpboundary.candidate(6)}")   // true
+// ```
+pub fn choose(seed: Int, avoid: [Bytes]) -> MpBoundary []
+    choose_by(seed, t => any_holds(avoid, bytes.from_str("--" + t)))
+
+// Whether any byte string holds `needle`.
+fn any_holds(hays: [Bytes], needle: Bytes) -> Bool
+    var found = false
+    for hay in hays
+        if bytes.find(hay, needle, 0) != None
+            found = true
+    found

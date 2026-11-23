@@ -1,0 +1,137 @@
+// multipart_edge_tests — the boundary grammar, the Content-Type header,
+// and every refusal of the reader.
+
+use std.test
+use std.bytes
+use std.str
+use mperr
+use mpboundary
+use mpread
+use mpwrite
+
+fn bnd(s: Str) -> mpboundary.MpBoundary
+    match mpboundary.parse(s)
+        Ok(b)  => b
+        Err(e) =>
+            test.fail(e.message())
+            mpboundary.choose(0, [])
+
+fn fault_of(raw: Str) -> Str
+    match mpread.parse(bytes.from_str(raw), bnd("XX"))
+        Ok(parts) => "ok ${list.len(parts)}"
+        Err(e)    => mperr.code_of(e)
+
+fn boundary_fault(s: Str) -> Str
+    match mpboundary.parse(s)
+        Ok(_)  => "ok"
+        Err(e) => mperr.code_of(e)
+
+fn in_header(v: Str) -> Str
+    match mpboundary.in_content_type(v)
+        Ok(b)  => mpboundary.text(b)
+        Err(e) => mperr.code_of(e)
+
+// ── The boundary ────────────────────────────────────────────────────
+
+@test
+fn test_a_boundary_is_one_to_seventy_characters_from_the_rfc_set()
+    test.assert_eq(boundary_fault("a"), "ok")
+    test.assert_eq(boundary_fault("0aZ'()+_,-./:=? x"), "ok")
+    test.assert_eq(boundary_fault(str.repeat("b", 70)), "ok")
+    test.assert_eq(boundary_fault(str.repeat("b", 71)), "bad-boundary")
+    test.assert_eq(boundary_fault(""), "bad-boundary")
+    test.assert_eq(boundary_fault("ends with space "), "bad-boundary")
+    test.assert_eq(boundary_fault("semi;colon"), "bad-boundary")
+    test.assert_eq(boundary_fault("quote\"d"), "bad-boundary")
+    test.assert_eq(boundary_fault("tab\there"), "bad-boundary")
+    test.assert_eq(boundary_fault("é"), "bad-boundary")
+    test.assert_eq(mperr.MpBadBoundary("a;b").message(), "`a;b` is not a boundary RFC 2046 allows")
+
+@test
+fn test_the_boundary_is_found_in_a_content_type_value()
+    test.assert_eq(in_header("multipart/form-data; boundary=AaB03x"), "AaB03x")
+    test.assert_eq(in_header("multipart/form-data; boundary=\"two words\""), "two words")
+    test.assert_eq(in_header("Multipart/Form-Data; BOUNDARY=abc; charset=utf-8"), "abc")
+    test.assert_eq(in_header("multipart/form-data; boundary=\"a:b\"; charset=utf-8"), "a:b")
+    test.assert_eq(in_header("multipart/form-data; boundary=abc ; x=y"), "abc")
+    test.assert_eq(in_header("multipart/form-data"), "bad-boundary")
+    test.assert_eq(in_header("multipart/form-data; boundary="), "bad-boundary")
+    test.assert_eq(in_header("multipart/form-data; boundary=\"unterminated"), "unterminated")
+
+// ── Reader refusals ─────────────────────────────────────────────────
+
+@test
+fn test_a_body_must_begin_with_the_delimiter()
+    test.assert_eq(fault_of(""), "no-opening")
+    test.assert_eq(fault_of("--X"), "no-opening")
+    test.assert_eq(fault_of("junk\r\n--XX--\r\n"), "no-opening")
+
+@test
+fn test_a_body_must_end_with_the_closing_delimiter()
+    test.assert_eq(fault_of("--XX"), "no-closing")
+    test.assert_eq(fault_of("--XX\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nv"), "no-closing")
+    test.assert_eq(fault_of("--XX\r\nContent-Disposition: form-data; name=\"a\"\r\n"), "no-closing")
+    test.assert_eq(fault_of("--XX\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nv\r\n--XX"), "no-closing")
+    test.assert_eq(fault_of("--XX junk"), "no-closing")
+
+@test
+fn test_an_epilogue_after_the_closing_delimiter_is_ignored()
+    test.assert_eq(fault_of("--XX--"), "ok 0")
+    test.assert_eq(fault_of("--XX--\r\nsome epilogue\r\n--XX\r\n"), "ok 0")
+
+@test
+fn test_a_part_needs_a_disposition_a_name_and_well_formed_headers()
+    test.assert_eq(fault_of("--XX\r\n\r\nv\r\n--XX--"), "no-disposition")
+    test.assert_eq(fault_of("--XX\r\nContent-Type: text/plain\r\n\r\nv\r\n--XX--"), "no-disposition")
+    test.assert_eq(fault_of("--XX\r\nContent-Disposition: attachment; name=\"a\"\r\n\r\nv\r\n--XX--"),
+        "no-disposition")
+    test.assert_eq(fault_of("--XX\r\nContent-Disposition: form-data\r\n\r\nv\r\n--XX--"), "no-name")
+    test.assert_eq(fault_of("--XX\r\nContent-Disposition: form-data; name=\"unterminated\r\n\r\nv\r\n--XX--"),
+        "no-name")
+    test.assert_eq(fault_of("--XX\r\nno colon here\r\n\r\nv\r\n--XX--"), "bad-part-headers")
+    test.assert_eq(mperr.MpNoName(2).message(), "part 2 has no name")
+    test.assert_eq(mperr.MpNoDisposition(0).message(), "part 0 has no Content-Disposition: form-data header")
+    test.assert_eq(mperr.MpBadPartHeaders(1).message(), "part 1 has malformed headers")
+    test.assert_eq(mperr.MpNoOpening.message(), "the body does not begin with the boundary")
+    test.assert_eq(mperr.MpNoClosing.message(), "the body ends before the closing boundary")
+
+@test
+fn test_header_names_are_case_insensitive_and_extra_headers_are_ignored()
+    let raw = "--XX\r\ncontent-disposition: FORM-DATA; name=\"a\"\r\nX-Other: 1\r\ncontent-type: text/x\r\n\r\nv\r\n--XX--\r\n"
+    match mpread.parse(bytes.from_str(raw), bnd("XX"))
+        Err(e)    => test.fail(e.message())
+        Ok(parts) =>
+            test.assert_eq(parts[0].name, "a")
+            test.assert_eq(parts[0].content_type, "text/x")
+            test.assert(not parts[0].is_file)
+
+@test
+fn test_the_boundary_text_inside_content_ends_nothing_unless_a_delimiter_follows()
+    // `--XXY` is not a delimiter, and neither is `--XX ` or a boundary at
+    // the end of the data.
+    let raw = "--XX\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nx\r\n--XXY\r\n--XX \r\n--XX--\r\n"
+    match mpread.parse(bytes.from_str(raw), bnd("XX"))
+        Err(e)    => test.fail(e.message())
+        Ok(parts) =>
+            test.assert_eq(list.len(parts), 1)
+            test.assert_eq(bytes.to_str(parts[0].data), "x\r\n--XXY\r\n--XX ")
+    test.assert_eq(fault_of("--XX\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nx\r\n--XXY"), "no-closing")
+
+@test
+fn test_a_writer_that_is_given_the_delimiter_in_a_part_refuses_before_writing()
+    let b = bnd("XX")
+    match mpwrite.body(b, [mpwrite.field("a", "ok"), mpwrite.field("b", "a--XXb")])
+        Ok(_)  => test.fail("the content holds the delimiter")
+        Err(e) =>
+            test.assert_eq(mperr.code_of(e), "boundary-in-content")
+            test.assert_eq(e.message(), "part 1 holds the delimiter, so the body would end it early")
+
+@test
+fn test_a_file_part_with_no_media_type_is_an_octet_stream()
+    let b = bnd("XX")
+    let head = bytes.to_str(mpwrite.head_of(b, mpwrite.file("f", "n", "", bytes.zeros(0))))
+    test.assert(str.contains(head, "Content-Type: application/octet-stream\r\n"))
+    let text_head = bytes.to_str(mpwrite.head_of(b, mpwrite.field("f", "")))
+    test.assert(not str.contains(text_head, "Content-Type"))
+    test.assert_eq(bytes.len(mpwrite.tail()), 2)
+    test.assert_eq(bytes.to_str(mpwrite.closing(b)), "--XX--\r\n")
